@@ -1,121 +1,149 @@
 # claw-skill-cc
 
-OpenClaw Skill: Claude Code Orchestrator — 让 OpenClaw 调度 Claude Code CLI 执行编码任务。
+OpenClaw Skill: Claude Code Orchestrator — **Dispatch 模式**，发射后不管，完成自动回报。
 
 ## 架构
 
 ```
 OpenClaw（调度层 / 技术 PM）
   ├── 理解需求、拆解任务
-  ├── exec 调用 Claude Code CLI
-  ├── 每 5-10 秒轮询输出
-  ├── 自主决策（遇到问题时）
-  └── 整合结果、汇报进度
+  ├── dispatch 到 Claude Code（发射后不管）
+  └── 收到 wake event → 读 latest.json → 处理结果
         ↓
 Claude Code（执行层 / 执行工程师）
-  ├── 持续会话（acpx -s）
-  ├── 执行编码任务
-  └── NDJSON 流式输出
+  ├── 独立执行编码任务
+  ├── 支持 Agent Teams 协作
+  └── 完成 → Stop Hook 自动触发
+        ↓
+Stop Hook（回调层）
+  ├── 写 latest.json（数据通道 — 快递柜）
+  └── 发 wake event（信号通道 — 门铃）
 ```
+
+### 双通道设计
+
+| 只有 latest.json | 只有 wake event | 两者配合 |
+|-----------------|----------------|---------|
+| 结果存了，AGI 不知道 | AGI 醒了，不知细节 | AGI 立刻醒来读完整结果 ✅ |
+| 要等 heartbeat 发现 | 消息长度有限 | 实时 + 完整 |
+
+**容错**: wake event 失败不影响 latest.json，AGI 最迟在下次 heartbeat 也能读到。
 
 ## 前置条件
 
-### 必需
-
 - [OpenClaw](https://github.com/openclaw/openclaw) 已安装并运行
-- **Claude Code CLI** — 至少安装其中一种:
-  ```bash
-  # 方式 1: 直接安装 Claude Code CLI（推荐）
-  npm install -g @anthropic-ai/claude-code
-
-  # 方式 2: 通过 acpx（OpenClaw 内置 ACPX 插件通常已包含）
-  # 无需额外安装
-  ```
-
-### 可选
-
-- `acpx` — 用于持续会话模式（OpenClaw 内置 ACPX 插件通常已包含）
+- **Claude Code CLI**: `npm install -g @anthropic-ai/claude-code`
+- **Python 3**（脚本依赖）
 
 ## 安装
 
-将此 skill 目录复制到 OpenClaw 的 skills 目录:
-
 ```bash
-# 方式 1: 直接复制
-cp -r claw-skill-cc ~/.openclaw/skills/claude-code-orchestrator
+# 1. 链接 skill 到 OpenClaw
+ln -s $(pwd) ~/.openclaw/skills/claude-code-orchestrator
 
-# 方式 2: 符号链接（开发时推荐）
-ln -s $(pwd)/claw-skill-cc ~/.openclaw/skills/claude-code-orchestrator
+# 2. 设置执行权限
+chmod +x scripts/*.sh scripts/*.py hooks/*.sh
+
+# 3. 注册 Claude Code Hooks（合并到 ~/.claude/settings.json）
+# 参考 hooks/claude-settings.json 的内容，
+# 将 Stop 和 SessionEnd hook 添加到你的 ~/.claude/settings.json
 ```
 
-给脚本添加执行权限:
+### Hook 配置
 
-```bash
-chmod +x ~/.openclaw/skills/claude-code-orchestrator/scripts/*.sh
+将以下内容合并到 `~/.claude/settings.json`：
+
+```json
+{
+  "hooks": {
+    "Stop": [{"hooks": [{"type": "command", "command": "~/.openclaw/skills/claude-code-orchestrator/hooks/notify-agi.sh", "timeout": 10}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "~/.openclaw/skills/claude-code-orchestrator/hooks/notify-agi.sh", "timeout": 10}]}]
+  }
+}
 ```
 
-重启 OpenClaw 使 skill 生效。
+### 环境变量（可选）
+
+```bash
+export CC_RESULT_DIR=~/.openclaw/data/claude-code-results  # 结果目录
+export OPENCLAW_GATEWAY=http://127.0.0.1:18789             # Gateway 地址
+export OPENCLAW_TOKEN=your-token-here                       # Gateway token
+```
 
 ## 使用方式
 
-在 OpenClaw 对话中直接说:
+在 OpenClaw 对话中直接说：
 
 ```
-帮我用 Claude Code 实现一个用户注册功能
-```
-
-```
-让 Claude Code 重构 src/auth 模块
+dispatch 一个任务到 Claude Code：构建一个 Markdown 转 HTML 的工具，要有测试
 ```
 
 ```
-用 CC 修复 #123 号 bug
+用 Claude Code 构建一个 REST API，FastAPI + SQLite，管理 TODO 列表
 ```
 
-OpenClaw 会自动:
-1. 拆解任务为可执行的子任务
-2. 启动 Claude Code 后台执行
-3. 每 5-10 秒轮询进度
-4. 遇到问题时自主决策
-5. 完成后汇总报告
+```
+用 Claude Code 的 Agent Teams 协作模式构建一个落沙模拟游戏
+```
 
-## 执行模式
-
-| 模式 | 命令 | 适用场景 |
-|------|------|---------|
-| Direct | `claude --print` | 大多数场景，简单高效 |
-| ACPX Session | `acpx claude -s <name>` | 需要多轮交互的复杂任务 |
-| ACPX One-shot | `acpx claude exec` | 一次性任务 |
+OpenClaw 会自动：
+1. 拆解任务
+2. 调用 `cc-dispatch.sh` 派发（发射后不管）
+3. Claude Code 完成后 Hook 自动写 `latest.json` + 发 wake event
+4. OpenClaw 被唤醒，读取结果，汇总报告
 
 ## 项目结构
 
 ```
 claw-skill-cc/
-├── SKILL.md                  # 核心技能定义（OpenClaw 读取）
+├── SKILL.md                      # 核心技能定义（OpenClaw 读取）
+├── hooks/
+│   ├── notify-agi.sh             # Stop Hook（写结果 + 发通知）
+│   └── claude-settings.json      # Claude Code hooks 配置参考
 ├── scripts/
-│   ├── cc-invoke.sh          # 调用 Claude Code CLI
-│   ├── cc-poll.sh            # 轮询输出 + 完成检测
-│   └── cc-session.sh         # 会话管理（创建/恢复/关闭）
+│   ├── cc-dispatch.sh            # Bash 版任务派发
+│   ├── cc-dispatch.py            # Python 版任务派发（支持 Agent Teams）
+│   ├── cc-result.sh              # 读取/查询结果
+│   └── cc-session.sh             # ACPX 会话管理
 ├── references/
-│   └── task-strategy.md      # 任务拆解策略参考
-└── README.md                 # 本文件
+│   └── task-strategy.md          # 任务拆解策略参考
+└── README.md
 ```
 
-## 自主决策边界
+## 数据流
 
-### OpenClaw 自动处理（不问用户）
+```
+dispatch-claude-code.sh
+  ├─ 写入 task-meta.json（任务名、参数）
+  ├─ 启动 Claude Code（nohup 后台）
+  │   └─ Agent Teams lead + sub-agents 运行
+  │
+  └─ Claude Code 完成 → Stop Hook 自动触发
+      │
+      ├─ notify-agi.sh 执行：
+      │   ├─ 读取 task-meta.json + task-output.txt
+      │   ├─ 写入 latest.json（完整结果）
+      │   ├─ 发送 wake event → OpenClaw Gateway
+      │   └─ 写入 pending-wake.json（备选通道）
+      │
+      └─ AGI 读取 latest.json 处理结果
+```
 
-- 依赖安装失败
-- 测试/编译错误
-- 文件冲突
-- 路径/配置问题
+## 结果文件
 
-### 需要用户确认
+任务完成后，结果写入 `~/.openclaw/data/claude-code-results/latest.json`：
 
-- 权限不足（sudo 等）
-- 涉及生产环境
-- 需要 API Key 等敏感信息
-- 架构设计决策
+```json
+{
+  "session_id": "abc123",
+  "timestamp": "2026-04-08T17:00:00+00:00",
+  "task_name": "todo-api",
+  "cwd": "/home/user/projects/todo-api",
+  "event": "Stop",
+  "output": "Claude Code 完整输出...",
+  "status": "done"
+}
+```
 
 ## 作者
 
