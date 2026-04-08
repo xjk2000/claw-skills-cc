@@ -18,7 +18,9 @@ SKILL_NAME="claude-code-orchestrator"
 SKILL_DIR="$HOME/.openclaw/skills/$SKILL_NAME"
 RESULT_DIR="$HOME/.openclaw/data/claude-code-results"
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
-HOOK_CMD="$SKILL_DIR/hooks/notify-agi.sh"
+HOOK_NOTIFY="$SKILL_DIR/hooks/notify-agi.sh"
+HOOK_PERMISSION="$SKILL_DIR/hooks/permission-proxy.sh"
+HOOK_NOTIFICATION="$SKILL_DIR/hooks/notification-proxy.sh"
 
 # ── 卸载 ──
 if [[ "${1:-}" == "--uninstall" ]]; then
@@ -29,9 +31,12 @@ if [[ "${1:-}" == "--uninstall" ]]; then
 import json
 with open('$CLAUDE_SETTINGS') as f: s=json.load(f)
 h=s.get('hooks',{})
-for e in ['Stop','SessionEnd']:
+for e in ['Stop','SessionEnd','PermissionRequest','Notification']:
     if e in h:
-        h[e]=[g for g in h[e] if not any('notify-agi.sh' in x.get('command','') for x in g.get('hooks',[]))]
+        h[e]=[g for g in h[e] if not any(
+            any(kw in x.get('command','') for kw in ['notify-agi.sh','permission-proxy.sh','notification-proxy.sh'])
+            for x in g.get('hooks',[])
+        )]
         if not h[e]: del h[e]
 if not h: s.pop('hooks',None)
 with open('$CLAUDE_SETTINGS','w') as f: json.dump(s,f,indent=2,ensure_ascii=False)
@@ -65,23 +70,28 @@ mkdir -p "$RESULT_DIR"
 
 cp "$SCRIPT_DIR/SKILL.md"                    "$SKILL_DIR/"
 cp "$SCRIPT_DIR/README.md"                   "$SKILL_DIR/"
-cp "$SCRIPT_DIR/hooks/notify-agi.sh"         "$SKILL_DIR/hooks/"
-cp "$SCRIPT_DIR/hooks/claude-settings.json"  "$SKILL_DIR/hooks/"
-cp "$SCRIPT_DIR/scripts/cc-dispatch.sh"      "$SKILL_DIR/scripts/"
-cp "$SCRIPT_DIR/scripts/cc-dispatch.py"      "$SKILL_DIR/scripts/"
-cp "$SCRIPT_DIR/scripts/cc-result.sh"        "$SKILL_DIR/scripts/"
-cp "$SCRIPT_DIR/scripts/cc-session.sh"       "$SKILL_DIR/scripts/"
-cp "$SCRIPT_DIR/references/task-strategy.md" "$SKILL_DIR/references/"
+cp "$SCRIPT_DIR/hooks/notify-agi.sh"           "$SKILL_DIR/hooks/"
+cp "$SCRIPT_DIR/hooks/permission-proxy.sh"     "$SKILL_DIR/hooks/"
+cp "$SCRIPT_DIR/hooks/notification-proxy.sh"   "$SKILL_DIR/hooks/"
+cp "$SCRIPT_DIR/hooks/claude-settings.json"    "$SKILL_DIR/hooks/"
+cp "$SCRIPT_DIR/scripts/cc-dispatch.sh"        "$SKILL_DIR/scripts/"
+cp "$SCRIPT_DIR/scripts/cc-dispatch.py"        "$SKILL_DIR/scripts/"
+cp "$SCRIPT_DIR/scripts/cc-result.sh"          "$SKILL_DIR/scripts/"
+cp "$SCRIPT_DIR/scripts/cc-respond.sh"         "$SKILL_DIR/scripts/"
+cp "$SCRIPT_DIR/scripts/cc-session.sh"         "$SKILL_DIR/scripts/"
+cp "$SCRIPT_DIR/references/task-strategy.md"   "$SKILL_DIR/references/"
 
 chmod +x "$SKILL_DIR/hooks/"*.sh "$SKILL_DIR/scripts/"*.sh "$SKILL_DIR/scripts/"*.py
 
 ok "Skill 文件已安装"
 info "结果目录: $RESULT_DIR"
-echo "  ├── SKILL.md              → 技能定义（OpenClaw 读取）"
-echo "  ├── hooks/notify-agi.sh   → Stop Hook 回调脚本"
-echo "  ├── scripts/cc-dispatch.* → 任务派发脚本"
-echo "  ├── scripts/cc-result.sh  → 结果查询"
-echo "  └── references/           → 任务拆解策略"
+echo "  ├── SKILL.md                    → 技能定义"
+echo "  ├── hooks/notify-agi.sh         → Stop/SessionEnd 回调"
+echo "  ├── hooks/permission-proxy.sh   → 权限代理（透传给用户）"
+echo "  ├── hooks/notification-proxy.sh → 通知转发"
+echo "  ├── scripts/cc-dispatch.*       → 任务派发"
+echo "  ├── scripts/cc-respond.sh       → 权限响应"
+echo "  └── scripts/cc-result.sh        → 结果查询"
 
 # ══════════════════════════════════════════════════════
 step "第二部分：注册 Claude Code Hook → $CLAUDE_SETTINGS"
@@ -94,11 +104,15 @@ import json, os, shutil, sys
 from datetime import datetime
 
 path = "$CLAUDE_SETTINGS"
-hook_cmd = "$HOOK_CMD"
 
-new_hook = {"hooks": [{"type": "command", "command": hook_cmd, "timeout": 10}]}
+# Hook 定义: (事件名, 脚本路径, timeout, matcher)
+hook_defs = [
+    ("Stop",              "$HOOK_NOTIFY",       10,  None),
+    ("SessionEnd",        "$HOOK_NOTIFY",       10,  None),
+    ("PermissionRequest", "$HOOK_PERMISSION",   180, None),
+    ("Notification",      "$HOOK_NOTIFICATION", 10,  "permission_prompt|idle_prompt"),
+]
 
-# 读取或创建
 settings = {}
 if os.path.exists(path):
     bak = path + ".bak." + datetime.now().strftime("%Y%m%d%H%M%S")
@@ -112,26 +126,29 @@ if "hooks" not in settings:
     settings["hooks"] = {}
 
 added = []
-for event in ["Stop", "SessionEnd"]:
+for event, cmd, timeout, matcher in hook_defs:
     if event not in settings["hooks"]:
         settings["hooks"][event] = []
-    # 检查是否已注册
+    script_name = cmd.rsplit("/", 1)[-1]
     exists = any(
-        "notify-agi.sh" in h.get("command", "")
+        script_name in h.get("command", "")
         for g in settings["hooks"][event]
         for h in g.get("hooks", [])
     )
     if not exists:
-        settings["hooks"][event].append(new_hook)
+        entry = {"hooks": [{"type": "command", "command": cmd, "timeout": timeout}]}
+        if matcher:
+            entry["matcher"] = matcher
+        settings["hooks"][event].append(entry)
         added.append(event)
 
 with open(path, "w") as f:
     json.dump(settings, f, indent=2, ensure_ascii=False)
 
 if added:
-    print(f"  已注册 Hook 事件: {', '.join(added)}", file=sys.stderr)
+    print(f"  已注册 Hook: {', '.join(added)}", file=sys.stderr)
 else:
-    print("  Hook 已存在，跳过", file=sys.stderr)
+    print("  所有 Hook 已存在，跳过", file=sys.stderr)
 PYEOF
 
 ok "Claude Code Hook 已注册"
@@ -150,7 +167,7 @@ echo -e "${GREEN}│    ~/.openclaw/skills/$SKILL_NAME/   │${NC}"
 echo -e "${GREEN}│    ~/.openclaw/data/claude-code-results/            │${NC}"
 echo -e "${GREEN}│                                                     │${NC}"
 echo -e "${GREEN}│  Claude Code 侧:                                   │${NC}"
-echo -e "${GREEN}│    ~/.claude/settings.json (Stop + SessionEnd Hook) │${NC}"
+echo -e "${GREEN}│    ~/.claude/settings.json (4 Hooks 已注册)          │${NC}"
 echo -e "${GREEN}│                                                     │${NC}"
 echo -e "${GREEN}├─────────────────────────────────────────────────────┤${NC}"
 echo -e "${GREEN}│  可选：设置环境变量以启用 wake event                │${NC}"

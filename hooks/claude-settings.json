@@ -21,6 +21,29 @@
           }
         ]
       }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.openclaw/skills/claude-code-orchestrator/hooks/permission-proxy.sh",
+            "timeout": 180
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt|idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.openclaw/skills/claude-code-orchestrator/hooks/notification-proxy.sh",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

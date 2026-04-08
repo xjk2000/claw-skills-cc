@@ -9,6 +9,8 @@
 #   -n, --name             任务名称（必需）
 #   -w, --workdir          工作目录，默认当前目录
 #   --permission-mode      权限模式，默认 bypassPermissions
+#   --proxied              启用权限代理模式（permission-mode 设为 default，
+#                          权限请求透传给 OpenClaw 用户确认）
 #   --agent-teams          启用 Agent Teams 协作模式
 #   --teammate-mode        Agent Teams 模式: auto(默认) | manual
 #   --allowed-tools        允许的工具列表（逗号分隔）
@@ -33,6 +35,7 @@ PROMPT=""
 TASK_NAME=""
 WORKDIR="$(pwd)"
 PERMISSION_MODE="bypassPermissions"
+PROXIED=false
 AGENT_TEAMS=false
 TEAMMATE_MODE="auto"
 ALLOWED_TOOLS=""
@@ -45,6 +48,7 @@ while [[ $# -gt 0 ]]; do
         -n|--name)          TASK_NAME="$2"; shift 2 ;;
         -w|--workdir)       WORKDIR="$2"; shift 2 ;;
         --permission-mode)  PERMISSION_MODE="$2"; shift 2 ;;
+        --proxied)          PROXIED=true; shift ;;
         --agent-teams)      AGENT_TEAMS=true; shift ;;
         --teammate-mode)    TEAMMATE_MODE="$2"; shift 2 ;;
         --allowed-tools)    ALLOWED_TOOLS="$2"; shift 2 ;;
@@ -97,9 +101,16 @@ with open('$RESULT_DIR/task-meta.json', 'w') as f:
     json.dump(meta, f, indent=2, ensure_ascii=False)
 "
 
+# 权限代理模式：覆盖 permission-mode 为 default
+if [ "$PROXIED" = true ]; then
+    PERMISSION_MODE="default"
+    echo "[dispatch] 权限代理模式已启用 — 权限请求将透传给 OpenClaw 用户" >&2
+fi
+
 echo "=== Claude Code Dispatch ===" >&2
 echo "任务: $TASK_NAME" >&2
 echo "目录: $WORKDIR" >&2
+echo "权限: $PERMISSION_MODE$( [ "$PROXIED" = true ] && echo " (proxied → 用户确认)" || echo "" )" >&2
 echo "模式: $( [ "$AGENT_TEAMS" = true ] && echo "Agent Teams ($TEAMMATE_MODE)" || echo "单 Agent" )" >&2
 echo "============================" >&2
 
@@ -168,6 +179,8 @@ print(json.dumps({
     'workdir': '$WORKDIR',
     'output_file': '$OUTPUT_FILE',
     'result_dir': '$RESULT_DIR',
-    'status': 'dispatched'
+    'status': 'dispatched',
+    'proxied': $( [ "$PROXIED" = true ] && echo "True" || echo "False" ),
+    'permission_mode': '$PERMISSION_MODE'
 }, indent=2))
 "

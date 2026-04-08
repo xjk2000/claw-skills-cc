@@ -13,16 +13,19 @@ description: 'Dispatch coding tasks to Claude Code CLI with fire-and-forget patt
 OpenClaw Agent（调度层 / 技术 PM）
   ├── 理解需求、拆解任务
   ├── exec dispatch 到 Claude Code（发射后不管）
-  └── 收到 wake event → 读 latest.json → 处理结果
+  ├── 收到 wake event → 读 latest.json → 处理结果
+  └── 收到权限请求 → 读 pending-permission.json → 透传给用户
         ↓
 Claude Code（执行层 / 执行工程师）
   ├── 独立执行编码任务
   ├── 支持 Agent Teams 协作
+  ├── 需要权限 → PermissionRequest Hook → 等待用户决策
   └── 完成 → Stop Hook 自动触发
         ↓
-Stop Hook（回调层）
-  ├── 写 latest.json（数据通道 — 快递柜）
-  └── 发 wake event（信号通道 — 门铃）
+Hook 层（回调 + 权限代理）
+  ├── Stop Hook: 写 latest.json + 发 wake event
+  ├── PermissionRequest Hook: 写 pending-permission.json + 发 wake + 等待响应
+  └── Notification Hook: 写 notification.json + 发 wake
 ```
 
 ## 双通道设计
@@ -50,20 +53,27 @@ wake event  = 信号通道（通知 AGI 立刻来读）
 调用 `scripts/cc-dispatch.sh` 派发任务，**不等待完成**：
 
 ```bash
-# 基础任务
+# 基础任务（全自动，无权限确认）
 bash workdir:<skill-path>/scripts command:"./cc-dispatch.sh \
   -p '实现一个 Python 命令行计算器，支持加减乘除和历史记录' \
   -n 'calculator' \
   --permission-mode bypassPermissions \
   --workdir /path/to/project"
 
-# Agent Teams 协作任务
+# 权限代理模式（权限请求透传给用户）
 bash workdir:<skill-path>/scripts command:"./cc-dispatch.sh \
   -p '构建 REST API，FastAPI + SQLite，管理 TODO 列表' \
   -n 'todo-api' \
+  --proxied \
+  --workdir /path/to/project"
+
+# Agent Teams 协作任务
+bash workdir:<skill-path>/scripts command:"./cc-dispatch.sh \
+  -p '构建一个落沙模拟游戏，HTML/CSS + 物理引擎' \
+  -n 'sandbox-game' \
   --agent-teams \
   --teammate-mode auto \
-  --permission-mode bypassPermissions \
+  --proxied \
   --workdir /path/to/project"
 ```
 
@@ -127,10 +137,16 @@ scripts/cc-dispatch.sh \
   -p "任务描述" \
   -n "任务名称" \
   --workdir /project/path \
-  --permission-mode bypassPermissions \
+  [--permission-mode bypassPermissions] \
+  [--proxied] \
   [--agent-teams] \
   [--teammate-mode auto]
 ```
+
+| 参数 | 说明 |
+|------|------|
+| `--permission-mode bypassPermissions` | 全自动，无权限确认（默认） |
+| `--proxied` | 权限代理模式，权限请求透传给用户 |
 
 工作流程：
 1. 写入 `task-meta.json`（任务名、参数）
@@ -145,22 +161,38 @@ Python 版派发，功能同上但支持更复杂的参数组合。
 
 读取和解析 latest.json 结果。
 
+### cc-respond.sh
+
+响应 Claude Code 权限请求（允许/拒绝/修改）：
+
+```bash
+# 允许
+scripts/cc-respond.sh allow
+
+# 拒绝（附原因）
+scripts/cc-respond.sh deny "这个命令不安全"
+
+# 允许但修改命令
+scripts/cc-respond.sh allow --modify "npm run lint"
+
+# 查看当前待处理的权限请求
+scripts/cc-respond.sh pending
+```
+
 ### cc-session.sh
 
 ACPX 持续会话管理（创建/列出/恢复/关闭）。
 
 ## Hook 机制
 
-### 注册（~/.claude/settings.json）
+### 注册的 Hook 事件
 
-```json
-{
-  "hooks": {
-    "Stop": [{"hooks": [{"type": "command", "command": "<skill-path>/hooks/notify-agi.sh", "timeout": 10}]}],
-    "SessionEnd": [{"hooks": [{"type": "command", "command": "<skill-path>/hooks/notify-agi.sh", "timeout": 10}]}]
-  }
-}
-```
+| Hook 事件 | 脚本 | 触发时机 | timeout |
+|-----------|------|---------|--------|
+| `Stop` | notify-agi.sh | 任务完成 | 10s |
+| `SessionEnd` | notify-agi.sh | 会话结束 | 10s |
+| `PermissionRequest` | permission-proxy.sh | 权限确认弹窗 | 180s |
+| `Notification` | notification-proxy.sh | 通知/空闲 | 10s |
 
 ### notify-agi.sh 流程
 
@@ -174,6 +206,75 @@ ACPX 持续会话管理（创建/列出/恢复/关闭）。
 Stop 和 SessionEnd 都会触发 Hook。使用 `.hook-lock` 文件去重：
 - 30 秒内重复触发自动跳过
 - 只处理第一个事件（通常是 Stop）
+
+## 权限代理模式（Proxied Permission）
+
+当使用 `--proxied` 参数 dispatch 时，Claude Code 遇到权限请求不会自动跳过，而是透传给用户确认。
+
+### 流程
+
+```
+Claude Code 需要权限（如执行 rm -rf、修改配置文件）
+  → PermissionRequest Hook 触发
+    → 写入 pending-permission.json（工具名、命令、选项）
+    → 发 wake event 通知 OpenClaw
+    → 轮询等待 permission-response.json（最长 120s）
+  → OpenClaw 被唤醒
+    → 读取 pending-permission.json
+    → 透传给用户："⚠️ Claude Code 想执行 `rm -rf node_modules`，允许吗？"
+    → 用户回复 allow/deny
+    → 调用 cc-respond.sh 写入 permission-response.json
+  → Hook 读到响应 → 返回 allow/deny 给 Claude Code
+  → Claude Code 继续/跳过操作
+```
+
+### pending-permission.json 格式
+
+```json
+{
+  "hook_event": "PermissionRequest",
+  "timestamp": "2026-04-08T17:00:00+00:00",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "rm -rf node_modules",
+    "description": "Remove node_modules directory"
+  },
+  "status": "waiting_for_user",
+  "timeout_seconds": 120
+}
+```
+
+### OpenClaw 响应流程
+
+收到权限请求的 wake event 后：
+
+```bash
+# 1. 读取待处理请求
+bash workdir:<skill-path>/scripts command:"./cc-respond.sh pending"
+
+# 2. 向用户展示选项（在聊天中问用户）
+# "⚠️ Claude Code 想执行: rm -rf node_modules，允许吗？"
+
+# 3. 根据用户回复写入决策
+bash workdir:<skill-path>/scripts command:"./cc-respond.sh allow"
+# 或
+bash workdir:<skill-path>/scripts command:"./cc-respond.sh deny '不安全'"
+# 或修改命令后允许
+bash workdir:<skill-path>/scripts command:"./cc-respond.sh allow --modify 'rm -rf node_modules && npm install'"
+```
+
+### 超时处理
+
+如果 120 秒内用户未响应，默认拒绝（安全优先）。Claude Code 会收到拒绝消息并尝试替代方案。
+
+### 何时使用 proxied 模式
+
+| 场景 | 建议 |
+|------|------|
+| 信任的项目，常规开发 | `--permission-mode bypassPermissions` |
+| 涉及敲定操作、生产环境 | `--proxied` |
+| 需要用户确认关键步骤 | `--proxied` |
+| Agent Teams 多人协作 | `--proxied`（推荐） |
 
 ## 并行 Dispatch
 
@@ -198,3 +299,4 @@ bash workdir:<skill-path>/scripts command:"./cc-dispatch.sh -p '实现 UI...' -n
 5. **结果验证** — 收到回调后验证结果，不盲目信任
 6. **进度汇报** — dispatch 后告知用户，收到结果后汇总报告
 7. **安全边界** — 涉及权限、生产环境、敏感信息时必须请示用户
+8. **权限透传** — proxied 模式下，及时将权限请求展示给用户，超时默认拒绝
